@@ -5,6 +5,7 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 const HttpsProxyAgent = require('https-proxy-agent');
+const fs = require('fs');
 
 dotenv.config();
 const app = express();
@@ -13,18 +14,33 @@ app.use(express.json());
 
 const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL } = process.env;
 
-// Initialize proxy
-let proxyAgent;
-try {
-  proxyAgent = new HttpsProxyAgent(PROXY_URL);
-  console.log('ProxyAgent initialized');
-} catch (error) {
-  console.error('ProxyAgent error:', error.message);
-  process.exit(1);
+// Initialize proxy with fallback
+let proxyAgent = null;
+if (PROXY_URL) {
+  try {
+    proxyAgent = new HttpsProxyAgent(PROXY_URL);
+    console.log('ProxyAgent initialized');
+  } catch (error) {
+    console.error('ProxyAgent initialization failed:', error.message);
+    console.warn('Falling back to direct API calls (no proxy)');
+  }
+} else {
+  console.warn('PROXY_URL not set, using direct API calls');
 }
 
 // Initialize database
 const dbPath = process.env.DB_PATH || './xashmarkets.db';
+
+// Clear database file if corrupted
+if (fs.existsSync(dbPath)) {
+  try {
+    fs.unlinkSync(dbPath);
+    console.log(`Cleared existing database file: ${dbPath}`);
+  } catch (error) {
+    console.error(`Error clearing database file: ${error.message}`);
+  }
+}
+
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Database error:', err.message);
@@ -43,7 +59,7 @@ db.serialize(() => {
     id TEXT PRIMARY KEY,
     identifier TEXT NOT NULL,
     x_user_id TEXT NOT NULL,
-    event_type TEXT NOT NOT NULL,
+    event_type TEXT NOT NULL,
     tweet_id TEXT,
     option_text TEXT,
     timestamp DATETIME NOT NULL
@@ -55,34 +71,51 @@ db.serialize(() => {
   console.log('Database tables initialized');
 });
 
-// Get @XashMarkets user ID at startup
-let xashMarketsUserId;
-axios.get('https://api.x.com/2/users/by/username/XashMarkets', {
-  headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` },
-  httpsAgent: proxyAgent
-}).then(response => {
-  xashMarketsUserId = response.data.data.id;
-  console.log(`@XashMarkets user ID: ${xashMarketsUserId}`);
-}).catch(error => {
-  console.error('Error fetching @XashMarkets user ID:', error.message);
-  process.exit(1);
-});
-
-// Poll likes every 20 minutes with retry logic
+// Fetch with retry
 async function fetchWithRetry(url, options, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
-      const response = await axios.get(url, options);
+      const response = await axios.get(url, { ...options, httpsAgent: proxyAgent });
       return response.data;
     } catch (error) {
-      if (i === retries - 1 || error.response?.status < 500) throw error;
+      if (i === retries - 1 || error.response?.status < 500) {
+        throw error;
+      }
       console.warn(`Retry ${i + 1} for ${url}: ${error.message}`);
-      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i))); // Exponential backoff
+      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
     }
   }
 }
 
+// Get @XashMarkets user ID with retry
+let xashMarketsUserId;
+async function fetchXashMarketsUserId() {
+  for (let i = 0; i < 3; i++) {
+    try {
+      const response = await fetchWithRetry('https://api.x.com/2/users/by/username/XashMarkets', {
+        headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
+      });
+      xashMarketsUserId = response.data.id;
+      console.log(`@XashMarkets user ID: ${xashMarketsUserId}`);
+      return;
+    } catch (error) {
+      console.error(`Attempt ${i + 1} to fetch @XashMarkets user ID failed:`, error.message);
+      if (i === 2) {
+        console.error('Failed to fetch @XashMarkets user ID after retries, exiting');
+        process.exit(1);
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
+    }
+  }
+}
+fetchXashMarketsUserId();
+
+// Poll likes every 20 minutes
 setInterval(async () => {
+  if (!xashMarketsUserId) {
+    console.warn('Skipping polling: @XashMarkets user ID not set');
+    return;
+  }
   try {
     db.all(`SELECT tweet_id, option_text FROM poll_options`, async (err, optionRows) => {
       if (err) {
@@ -93,8 +126,7 @@ setInterval(async () => {
         try {
           // Verify tweet belongs to @XashMarkets
           const tweetData = await fetchWithRetry(`https://api.x.com/2/tweets/${tweet_id}`, {
-            headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` },
-            httpsAgent: proxyAgent
+            headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
           });
           if (tweetData.data.author_id !== xashMarketsUserId) {
             console.log(`Skipping tweet ${tweet_id}: not authored by @XashMarkets`);
@@ -103,8 +135,7 @@ setInterval(async () => {
 
           // Fetch likers
           const likersData = await fetchWithRetry(`https://api.x.com/2/tweets/${tweet_id}/liking_users`, {
-            headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` },
-            httpsAgent: proxyAgent
+            headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
           });
           const likers = likersData.data || [];
           for (const liker of likers) {
@@ -226,8 +257,7 @@ app.post('/auth/token', async (req, res) => {
 async function getUserId(token) {
   try {
     const response = await fetchWithRetry('https://api.x.com/2/users/me', {
-      headers: { Authorization: `Bearer ${token}` },
-      httpsAgent: proxyAgent
+      headers: { Authorization: `Bearer ${token}` }
     });
     return response.data.id;
   } catch (error) {
@@ -247,8 +277,7 @@ app.get('/user/:identifier', async (req, res) => {
         if (err) throw err;
         if (!row) return res.status(404).json({ error: 'User not found' });
         const response = await fetchWithRetry('https://api.x.com/2/users/me', {
-          headers: { Authorization: `Bearer ${row.x_access_token}` },
-          httpsAgent: proxyAgent
+          headers: { Authorization: `Bearer ${row.x_access_token}` }
         });
         res.json(response.data);
         console.log(`Fetched user data for ${identifier}`);
