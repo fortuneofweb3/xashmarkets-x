@@ -1,7 +1,5 @@
 node_modules
-client/node_modules
 server/node_modules
-client/build
 .env
-client/.env
-server/.env
+xashmarkets.db
+server/ca.crt
