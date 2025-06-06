@@ -15,6 +15,12 @@ app.use(express.json());
 
 const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL } = process.env;
 
+// Validate environment variables
+if (!X_BEARER_TOKEN) {
+  console.error('X_BEARER_TOKEN is not set. Exiting.');
+  process.exit(1);
+}
+
 // Initialize proxy with SSL bypass
 let proxyAgent = null;
 if (PROXY_URL) {
@@ -33,8 +39,6 @@ if (PROXY_URL) {
 
 // Initialize database
 const dbPath = process.env.DB_PATH || './xashmarkets.db';
-
-// Clear database file if corrupted
 if (fs.existsSync(dbPath)) {
   try {
     fs.unlinkSync(dbPath);
@@ -81,8 +85,11 @@ async function fetchWithRetry(url, options, retries = 3) {
       const response = await axios.get(url, { ...options, httpsAgent: proxyAgent });
       return response.data;
     } catch (error) {
-      console.warn(`Retry ${i + 1} for ${url}: ${error.message}`);
-      if (i === retries - 1 || !error.message.includes('certificate')) {
+      console.error(`Retry ${i + 1} for ${url}: ${error.message}`);
+      if (error.response) {
+        console.error(`HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+      }
+      if (i === retries - 1 || !error.message.includes('certificate') && error.response?.status !== 403) {
         throw error;
       }
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
@@ -103,6 +110,9 @@ async function fetchXashMarketsUserId() {
       return;
     } catch (error) {
       console.error(`Attempt ${i + 1} to fetch @XashMarkets user ID failed:`, error.message);
+      if (error.response) {
+        console.error(`HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+      }
       if (i === 2) {
         console.warn('Falling back to direct API calls for user ID fetch');
         try {
@@ -114,6 +124,9 @@ async function fetchXashMarketsUserId() {
           return;
         } catch (directError) {
           console.error('Direct fetch failed:', directError.message);
+          if (directError.response) {
+            console.error(`HTTP ${directError.response.status}: ${JSON.stringify(directError.response.data)}`);
+          }
           console.error('Failed to fetch @XashMarkets user ID, exiting');
           process.exit(1);
         }
@@ -190,6 +203,9 @@ setInterval(async () => {
           }
         } catch (error) {
           console.error(`Error processing tweet ${tweet_id}:`, error.message);
+          if (error.response) {
+            console.error(`HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+          }
         }
       }
     });
@@ -276,6 +292,9 @@ async function getUserId(token) {
     return response.data.id;
   } catch (error) {
     console.error('Get user ID error:', error.message);
+    if (error.response) {
+      console.error(`HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+    }
     throw error;
   }
 }
