@@ -5,16 +5,19 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 const HttpsProxyAgent = require('https-proxy-agent');
+const fs = require('fs');
 
 dotenv.config();
 const app = express();
 app.use(cors({ origin: ['https://xashmarkets-x-client.onrender.com', 'https://dev.fun'] }));
 app.use(express.json());
 
-const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL, TWEET_IDS } = process.env;
-const tweetIds = TWEET_IDS ? TWEET_IDS.split(',') : [];
+const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL } = process.env;
 const db = new sqlite3.Database('xashmarkets.db');
-const proxyAgent = new HttpsProxyAgent(PROXY_URL);
+const proxyAgent = new HttpsProxyAgent({
+  ...new URL(PROXY_URL),
+  ca: fs.readFileSync('ca.crt')
+});
 
 // Initialize database
 db.serialize(() => {
@@ -31,6 +34,25 @@ db.serialize(() => {
     tweet_id TEXT,
     timestamp DATETIME NOT NULL
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS tweet_ids (
+    tweet_id TEXT PRIMARY KEY
+  )`);
+});
+
+// Add tweet IDs
+app.post('/add-tweet-ids', async (req, res) => {
+  const { tweetIds } = req.body;
+  try {
+    if (!Array.isArray(tweetIds) || tweetIds.length === 0) {
+      return res.status(400).json({ error: 'Invalid or empty tweetIds array' });
+    }
+    const stmt = db.prepare(`INSERT OR IGNORE INTO tweet_ids (tweet_id) VALUES (?)`);
+    tweetIds.forEach(tweetId => stmt.run(tweetId));
+    stmt.finalize();
+    res.json({ status: 'Tweet IDs added' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Link DevFun identifier to X account
@@ -139,21 +161,28 @@ app.post('/check-likes', async (req, res) => {
         if (err) throw err;
         if (!row) return res.status(404).json({ error: 'User not found' });
         const xUserId = row.x_user_id;
-        for (const tweetId of tweetIds) {
-          const response = await axios.get(`https://api.x.com/2/tweets/${tweetId}/liking_users`, {
-            headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` },
-            httpsAgent: proxyAgent
-          });
-          const likers = response.data.data || [];
-          if (likers.find(liker => liker.id === xUserId)) {
-            db.run(
-              `INSERT OR REPLACE INTO events (id, identifier, x_user_id, event_type, tweet_id, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))`,
-              [uuidv4(), identifier, xUserId, 'liked_tweet', tweetId],
-              (err) => { if (err) console.error(err); }
-            );
+        db.all(
+          `SELECT tweet_id FROM tweet_ids`,
+          async (err, tweetRows) => {
+            if (err) throw err;
+            const tweetIds = tweetRows.map(row => row.tweet_id);
+            for (const tweetId of tweetIds) {
+              const response = await axios.get(`https://api.x.com/2/tweets/${tweetId}/liking_users`, {
+                headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` },
+                httpsAgent: proxyAgent
+              });
+              const likers = response.data.data || [];
+              if (likers.find(liker => liker.id === xUserId)) {
+                db.run(
+                  `INSERT OR REPLACE INTO events (id, identifier, x_user_id, event_type, tweet_id, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+                  [uuidv4(), identifier, xUserId, 'liked_tweet', tweetId],
+                  (err) => { if (err) console.error(err); }
+                );
+              }
+            }
+            res.json({ status: 'Likes checked' });
           }
-        }
-        res.json({ status: 'Likes checked' });
+        );
       }
     );
   } catch (e) {
@@ -170,6 +199,6 @@ app.get('/auth', (req, res) => {
   const codeChallenge = 'challenge';
   const authUrl = `https://x.com/i/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=plain`;
   res.redirect(authUrl);
-  });
+});
 
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
