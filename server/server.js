@@ -5,7 +5,6 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 const HttpsProxyAgent = require('https-proxy-agent');
-const fs = require('fs');
 
 dotenv.config();
 const app = express();
@@ -13,11 +12,8 @@ app.use(cors({ origin: ['https://xashmarkets-x-client.onrender.com', 'https://de
 app.use(express.json());
 
 const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL } = process.env;
+const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 const db = new sqlite3.Database('xashmarkets.db');
-const proxyAgent = new HttpsProxyAgent({
-  ...new URL(PROXY_URL),
-  ca: fs.readFileSync('ca.crt')
-});
 
 // Initialize database
 db.serialize(() => {
