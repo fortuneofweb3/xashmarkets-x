@@ -5,6 +5,7 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 const HttpsProxyAgent = require('https-proxy-agent');
+const https = require('https');
 const fs = require('fs');
 
 dotenv.config();
@@ -14,12 +15,14 @@ app.use(express.json());
 
 const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL } = process.env;
 
-// Initialize proxy with fallback
+// Initialize proxy with SSL bypass
 let proxyAgent = null;
 if (PROXY_URL) {
   try {
-    proxyAgent = new HttpsProxyAgent(PROXY_URL);
-    console.log('ProxyAgent initialized');
+    proxyAgent = new HttpsProxyAgent(PROXY_URL, {
+      rejectUnauthorized: false // Bypass self-signed certificate (temporary)
+    });
+    console.log('ProxyAgent initialized with SSL bypass');
   } catch (error) {
     console.error('ProxyAgent initialization failed:', error.message);
     console.warn('Falling back to direct API calls (no proxy)');
@@ -78,10 +81,10 @@ async function fetchWithRetry(url, options, retries = 3) {
       const response = await axios.get(url, { ...options, httpsAgent: proxyAgent });
       return response.data;
     } catch (error) {
-      if (i === retries - 1 || error.response?.status < 500) {
+      console.warn(`Retry ${i + 1} for ${url}: ${error.message}`);
+      if (i === retries - 1 || !error.message.includes('certificate')) {
         throw error;
       }
-      console.warn(`Retry ${i + 1} for ${url}: ${error.message}`);
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
     }
   }
@@ -101,8 +104,19 @@ async function fetchXashMarketsUserId() {
     } catch (error) {
       console.error(`Attempt ${i + 1} to fetch @XashMarkets user ID failed:`, error.message);
       if (i === 2) {
-        console.error('Failed to fetch @XashMarkets user ID after retries, exiting');
-        process.exit(1);
+        console.warn('Falling back to direct API calls for user ID fetch');
+        try {
+          const response = await axios.get('https://api.x.com/2/users/by/username/XashMarkets', {
+            headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
+          });
+          xashMarketsUserId = response.data.id;
+          console.log(`@XashMarkets user ID (direct): ${xashMarketsUserId}`);
+          return;
+        } catch (directError) {
+          console.error('Direct fetch failed:', directError.message);
+          console.error('Failed to fetch @XashMarkets user ID, exiting');
+          process.exit(1);
+        }
       }
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
     }
@@ -128,7 +142,7 @@ setInterval(async () => {
           const tweetData = await fetchWithRetry(`https://api.x.com/2/tweets/${tweet_id}`, {
             headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
           });
-          if (tweetData.data.author_id !== xashMarketsUserId) {
+          if (tweetData.data?.author_id !== xashMarketsUserId) {
             console.log(`Skipping tweet ${tweet_id}: not authored by @XashMarkets`);
             continue;
           }
@@ -267,29 +281,6 @@ async function getUserId(token) {
 }
 
 // Get user data
-app.get('/user/:identifier', async (req, res) => {
-  const { identifier } = req.params;
-  try {
-    db.get(
-      `SELECT x_user_id, x_access_token FROM users WHERE identifier = ?`,
-      [identifier],
-      async (err, row) => {
-        if (err) throw err;
-        if (!row) return res.status(404).json({ error: 'User not found' });
-        const response = await fetchWithRetry('https://api.x.com/2/users/me', {
-          headers: { Authorization: `Bearer ${row.x_access_token}` }
-        });
-        res.json(response.data);
-        console.log(`Fetched user data for ${identifier}`);
-      }
-    );
-  } catch (error) {
-    console.error('Get user data error:', error.message);
-    res.status(500).json({ error: error.response?.data?.error || error.message });
-  }
-});
-
-// Get events
 app.get('/events/:identifier', async (req, res) => {
   const { identifier } = req.params;
   try {
@@ -309,7 +300,7 @@ app.get('/events/:identifier', async (req, res) => {
 });
 
 // OAuth redirect
-app.get('/auth', (req, res) => {
+app.get('/auth', async (req, res) => {
   try {
     const clientId = X_CLIENT_ID;
     const redirectUri = req.headers.referer?.includes('dev.fun') ? 'https://dev.fun/p/6ff87d1cb6c36286929c' : X_REDIRECT_URI;
