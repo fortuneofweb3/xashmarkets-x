@@ -7,10 +7,11 @@ const { v4: uuidv4 } = require('uuid');
 const HttpsProxyAgent = require('https-proxy-agent');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
 
 dotenv.config();
 const app = express();
-app.use(cors({ origin: ['https://xashmarkets-x-client.onrender.com', 'https://dev.fun', 'https://2-19-8-sandpack.codesandbox.io'] }));
+app.use(cors({ origin: ['https://xashmarkets-x-client.onrender.com', 'https://dev.live', 'https://2-19-8-sandpack.codesandbox.io'] }));
 app.use(express.json());
 
 const { X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, PORT, X_BEARER_TOKEN, PROXY_URL } = process.env;
@@ -21,14 +22,19 @@ if (!X_BEARER_TOKEN) {
   process.exit(1);
 }
 
-// Initialize proxy with SSL bypass
+// Initialize proxy with CA certificate or SSL bypass
 let proxyAgent = null;
+const caCertPath = path.join(__dirname, 'certs', 'brightdata_ca.crt');
 if (PROXY_URL) {
   try {
-    proxyAgent = new HttpsProxyAgent(PROXY_URL, {
-      rejectUnauthorized: false // Bypass self-signed certificate (temporary)
-    });
-    console.log('ProxyAgent initialized with SSL bypass');
+    if (fs.existsSync(caCertPath)) {
+      const caCert = fs.readFileSync(caCertPath);
+      proxyAgent = new HttpsProxyAgent(PROXY_URL, { ca: caCert });
+      console.log('ProxyAgent initialized with CA certificate');
+    } else {
+      proxyAgent = new HttpsProxyAgent(PROXY_URL, { rejectUnauthorized: false });
+      console.warn('CA certificate not found, using SSL bypass (rejectUnauthorized: false)');
+    }
   } catch (error) {
     console.error('ProxyAgent initialization failed:', error.message);
     console.warn('Falling back to direct API calls (no proxy)');
@@ -78,7 +84,7 @@ db.serialize(() => {
   console.log('Database tables initialized');
 });
 
-// Fetch with retry
+// Fetch with retry, handling 429
 async function fetchWithRetry(url, options, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -88,8 +94,14 @@ async function fetchWithRetry(url, options, retries = 3) {
       console.error(`Retry ${i + 1} for ${url}: ${error.message}`);
       if (error.response) {
         console.error(`HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+        if (error.response.status === 429) {
+          const waitTime = Math.pow(2, i) * 1000 + Math.random() * 100; // Exponential backoff
+          console.warn(`Rate limit hit (429), waiting ${waitTime / 1000}s`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          continue;
+        }
       }
-      if (i === retries - 1 || !error.message.includes('certificate') && error.response?.status !== 403) {
+      if (i === retries - 1) {
         throw error;
       }
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
@@ -97,23 +109,27 @@ async function fetchWithRetry(url, options, retries = 3) {
   }
 }
 
-// Get @XashMarkets user ID with retry
-let xashMarketsUserId;
+// Get @XashMarkets user ID with caching
+let xashMarketsUserId = null;
 async function fetchXashMarketsUserId() {
-  for (let i = 0; i < 3; i++) {
+  if (xashMarketsUserId) {
+    console.log(`Using cached @XashMarkets user ID: ${xashMarketsUserId}`);
+    return xashMarketsUserId;
+  }
+  for (let i = 0; i < 2; i++) {
     try {
       const response = await fetchWithRetry('https://api.x.com/2/users/by/username/XashMarkets', {
         headers: { Authorization: `Bearer ${X_BEARER_TOKEN}` }
       });
       xashMarketsUserId = response.data.id;
       console.log(`@XashMarkets user ID: ${xashMarketsUserId}`);
-      return;
+      return xashMarketsUserId;
     } catch (error) {
       console.error(`Attempt ${i + 1} to fetch @XashMarkets user ID failed:`, error.message);
       if (error.response) {
         console.error(`HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`);
       }
-      if (i === 2) {
+      if (i === 1) {
         console.warn('Falling back to direct API calls for user ID fetch');
         try {
           const response = await axios.get('https://api.x.com/2/users/by/username/XashMarkets', {
@@ -121,14 +137,14 @@ async function fetchXashMarketsUserId() {
           });
           xashMarketsUserId = response.data.id;
           console.log(`@XashMarkets user ID (direct): ${xashMarketsUserId}`);
-          return;
+          return xashMarketsUserId;
         } catch (directError) {
           console.error('Direct fetch failed:', directError.message);
           if (directError.response) {
             console.error(`HTTP ${directError.response.status}: ${JSON.stringify(directError.response.data)}`);
           }
-          console.error('Failed to fetch @XashMarkets user ID, exiting');
-          process.exit(1);
+          console.warn('Failed to fetch @XashMarkets user ID, will retry later');
+          return null;
         }
       }
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
@@ -140,8 +156,9 @@ fetchXashMarketsUserId();
 // Poll likes every 20 minutes
 setInterval(async () => {
   if (!xashMarketsUserId) {
-    console.warn('Skipping polling: @XashMarkets user ID not set');
-    return;
+    console.warn('Skipping polling: @XashMarkets user ID not set, retrying fetch');
+    xashMarketsUserId = await fetchXashMarketsUserId();
+    if (!xashMarketsUserId) return;
   }
   try {
     db.all(`SELECT tweet_id, option_text FROM poll_options`, async (err, optionRows) => {
@@ -262,7 +279,7 @@ app.post('/link-account', async (req, res) => {
 app.post('/auth/token', async (req, res) => {
   try {
     const { code } = req.body;
-    const redirectUri = req.headers.origin === 'https://dev.fun' ? 'https://dev.fun/p/6ff87d1cb6c36286929c' : X_REDIRECT_URI;
+    const redirectUri = req.headers.origin === 'https://dev.live' ? 'https://dev.live/p/6ff87d1cb6c36286929c' : X_REDIRECT_URI;
     const response = await axios.post('https://api.x.com/2/oauth2/token', {
       code,
       grant_type: 'authorization_code',
@@ -345,7 +362,7 @@ app.get('/events/:identifier', async (req, res) => {
 app.get('/auth', (req, res) => {
   try {
     const clientId = X_CLIENT_ID;
-    const redirectUri = req.headers.referer?.includes('dev.fun') ? 'https://dev.fun/p/6ff87d1cb6c36286929c' : X_REDIRECT_URI;
+    const redirectUri = req.headers.referer?.includes('dev.live') ? 'https://dev.live/p/6ff87d1cb6c36286929c' : X_REDIRECT_URI;
     const scope = 'tweet.read users.read like.read offline.access';
     const state = Math.random().toString(36).substring(2);
     const codeChallenge = 'challenge';
